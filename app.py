@@ -95,21 +95,37 @@ def org_detail_metrics(trk_df: pd.DataFrame, org_id: int):
     return inv_2025, inv_2026, total, yoy_delta, yoy_pct
 
 # ----------------------------
-# Robust Loaders (handle column name variants + sheet auto-detect)
+# Robust Loaders (normalize headers to handle underscores/slashes/spaces)
 # ----------------------------
+def _norm_header(h: str) -> str:
+    h = str(h).strip().lower()
+    out = []
+    prev_us = False
+    for ch in h:
+        if ch.isalnum():
+            out.append(ch)
+            prev_us = False
+        else:
+            if not prev_us:
+                out.append("_")
+                prev_us = True
+    return "".join(out).strip("_")
+
 @st.cache_data(show_spinner=False)
 def load_master(path=MASTER_FILE) -> pd.DataFrame:
     xl = pd.ExcelFile(path)
     sheet = MASTER_SHEET if MASTER_SHEET in xl.sheet_names else xl.sheet_names[0]
     df = pd.read_excel(path, sheet_name=sheet)
-    df.columns = [str(c).strip() for c in df.columns]
+    original_headers = list(df.columns)
+
+    df.columns = [_norm_header(c) for c in df.columns]
 
     col_map = {
-        "org_id": ["Org ID", "OrgID", "Org Id", "OrganizationID", "Organization ID", "Org_ID", "Org", "OrgID#"],
-        "org_name": ["Name", "Org Name", "Organization", "Organization Name", "OrgName", "Account"],
-        "caller": ["Section/Column", "Section", "Caller", "Owner", "Rep", "Assigned To", "Assignee"],
-        "email": ["Email", "E-mail", "Email Address", "Mail"],
-        "phone": ["Phone Number", "Phone", "Phone #", "Telephone", "Mobile"],
+        "org_id": ["org_id", "orgid", "organizationid", "organization_id"],
+        "org_name": ["name", "org_name", "organization", "organization_name", "orgname", "account"],
+        "caller": ["section_column", "sectioncolumn", "section", "caller", "owner", "rep", "assigned_to", "assignee"],
+        "email": ["email", "email_address", "e_mail", "mail"],
+        "phone": ["phone_number", "phone", "telephone", "mobile"],
     }
 
     def find_col(variants):
@@ -128,8 +144,12 @@ def load_master(path=MASTER_FILE) -> pd.DataFrame:
     if org_id_col is None: missing.append("Org ID")
     if org_name_col is None: missing.append("Name")
     if caller_col is None: missing.append("Section/Column")
+
     if missing:
-        raise ValueError(f"MASTER missing required columns {missing}. Found: {list(df.columns)}")
+        raise ValueError(
+            f"MASTER missing required columns {missing}. "
+            f"Original headers: {original_headers} | Normalized headers: {list(df.columns)}"
+        )
 
     out = pd.DataFrame()
     out["Org ID"] = pd.to_numeric(df[org_id_col], errors="coerce").astype("Int64")
@@ -147,16 +167,18 @@ def load_tracking(path=TRACKING_FILE) -> pd.DataFrame:
     xl = pd.ExcelFile(path)
     sheet = TRACKING_SHEET if TRACKING_SHEET in xl.sheet_names else xl.sheet_names[0]
     df = pd.read_excel(path, sheet_name=sheet)
-    df.columns = [str(c).strip() for c in df.columns]
+    original_headers = list(df.columns)
+
+    df.columns = [_norm_header(c) for c in df.columns]
 
     col_map = {
-        "org_id": ["OrganizationID", "Organization ID", "Org ID", "OrgID"],
-        "org_name": ["Organization Name", "Org Name", "Name", "Organization"],
-        "date_requested": ["Date Requested", "Requested Date", "Invite Date", "DateRequest"],
-        "event_year": ["Start Date Calendar Year", "Event Year", "Start Year", "Calendar Year"],
-        "event_name": ["Event name", "Event Name", "Event", "EventTitle"],
-        "reg_status": ["Registration Status", "Reg Status", "Status"],
-        "tag_level": ["Tag Level", "Level", "Tag", "Tier"],
+        "org_id": ["organizationid", "organization_id", "org_id", "orgid"],
+        "org_name": ["organization_name", "org_name", "name", "organization"],
+        "date_requested": ["date_requested", "requested_date", "invite_date", "daterequest"],
+        "event_year": ["start_date_calendar_year", "event_year", "start_year", "calendar_year"],
+        "event_name": ["event_name", "event", "eventtitle"],
+        "reg_status": ["registration_status", "reg_status", "status"],
+        "tag_level": ["tag_level", "level", "tag", "tier"],
     }
 
     def find_col(variants):
@@ -178,8 +200,12 @@ def load_tracking(path=TRACKING_FILE) -> pd.DataFrame:
     if org_id_col is None: missing.append("OrganizationID")
     if org_name_col is None: missing.append("Organization Name")
     if date_col is None: missing.append("Date Requested")
+
     if missing:
-        raise ValueError(f"TRACKING missing required columns {missing}. Found: {list(df.columns)}")
+        raise ValueError(
+            f"TRACKING missing required columns {missing}. "
+            f"Original headers: {original_headers} | Normalized headers: {list(df.columns)}"
+        )
 
     out = pd.DataFrame()
     out["OrganizationID"] = pd.to_numeric(df[org_id_col], errors="coerce").astype("Int64")
@@ -210,7 +236,7 @@ with st.spinner("Loading data..."):
 tracking_raw["Season"] = tracking_raw["Date Requested"].apply(assign_season).astype("Int64")
 tracking_raw = tracking_raw[tracking_raw["Season"].isin([2025, 2026])].copy()
 
-# Global filter option lists from the FULL season-filtered tracking file
+# Global filter options from the FULL season-filtered tracking file
 ALL_TAG_OPTIONS = sorted(normalize_blank_series(tracking_raw["Tag Level"]).unique().tolist())
 ALL_REG_OPTIONS = sorted(normalize_blank_series(tracking_raw["Registration Status"]).unique().tolist())
 
@@ -230,6 +256,7 @@ trk = tracking_raw[tracking_raw["OrganizationID"].isin(assigned_org_ids)].copy()
 st.sidebar.header("Filters")
 tag_sel = st.sidebar.multiselect("Tag Level", ALL_TAG_OPTIONS, default=ALL_TAG_OPTIONS)
 reg_sel = st.sidebar.multiselect("Registration Status", ALL_REG_OPTIONS, default=ALL_REG_OPTIONS)
+
 trk = apply_blank_filter(trk, "Tag Level", tag_sel)
 trk = apply_blank_filter(trk, "Registration Status", reg_sel)
 
@@ -296,7 +323,7 @@ st.dataframe(
 
 st.divider()
 
-# 3) Selector (under comparison table)
+# 3) Selector
 st.markdown("### 🔎 Select an org to view details")
 
 org_labels = [
