@@ -44,53 +44,6 @@ def apply_blank_filter(df, col, selected):
         return df
     return df[ser.isin(selected)]
 
-@st.cache_data(show_spinner=False)
-def load_master(path=MASTER_FILE) -> pd.DataFrame:
-    df = pd.read_excel(path, sheet_name=MASTER_SHEET)
-    df.columns = [c.strip() for c in df.columns]
-
-    required = ["Org ID", "Name", "Section/Column"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"MASTER file missing columns: {missing}. Found: {list(df.columns)}")
-
-    df["Org ID"] = pd.to_numeric(df["Org ID"], errors="coerce").astype("Int64")
-    df["Name"] = df["Name"].map(_clean_str)
-    df["Section/Column"] = df["Section/Column"].map(_clean_str)
-
-    # Optional contact cols if present
-    for c in ["Phone Number", "Email"]:
-        if c in df.columns:
-            df[c] = df[c].map(_clean_str)
-
-    df = df.dropna(subset=["Org ID"])
-    df = df[df["Section/Column"] != ""].copy()
-    return df
-
-@st.cache_data(show_spinner=False)
-def load_tracking(path=TRACKING_FILE) -> pd.DataFrame:
-    usecols = [
-        "OrganizationID",
-        "Organization Name",
-        "Date Requested",
-        "Start Date Calendar Year",
-        "Event name",
-        "Registration Status",
-        "Tag Level",
-    ]
-    df = pd.read_excel(path, sheet_name=TRACKING_SHEET, usecols=usecols)
-    df.columns = [c.strip() for c in df.columns]
-
-    df["OrganizationID"] = pd.to_numeric(df["OrganizationID"], errors="coerce").astype("Int64")
-    df["Date Requested"] = pd.to_datetime(df["Date Requested"], errors="coerce")
-    df["Start Date Calendar Year"] = pd.to_numeric(df["Start Date Calendar Year"], errors="coerce").astype("Int64")
-
-    for c in ["Organization Name", "Event name", "Registration Status", "Tag Level"]:
-        df[c] = df[c].map(_clean_str)
-
-    df = df.dropna(subset=["OrganizationID"]).copy()
-    return df
-
 def assign_season(dt: pd.Timestamp):
     if pd.isna(dt):
         return pd.NA
@@ -142,6 +95,109 @@ def org_detail_metrics(trk_df: pd.DataFrame, org_id: int):
     return inv_2025, inv_2026, total, yoy_delta, yoy_pct
 
 # ----------------------------
+# Robust Loaders (handle column name variants + sheet auto-detect)
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def load_master(path=MASTER_FILE) -> pd.DataFrame:
+    xl = pd.ExcelFile(path)
+    sheet = MASTER_SHEET if MASTER_SHEET in xl.sheet_names else xl.sheet_names[0]
+    df = pd.read_excel(path, sheet_name=sheet)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    col_map = {
+        "org_id": ["Org ID", "OrgID", "Org Id", "OrganizationID", "Organization ID", "Org_ID", "Org", "OrgID#"],
+        "org_name": ["Name", "Org Name", "Organization", "Organization Name", "OrgName", "Account"],
+        "caller": ["Section/Column", "Section", "Caller", "Owner", "Rep", "Assigned To", "Assignee"],
+        "email": ["Email", "E-mail", "Email Address", "Mail"],
+        "phone": ["Phone Number", "Phone", "Phone #", "Telephone", "Mobile"],
+    }
+
+    def find_col(variants):
+        for v in variants:
+            if v in df.columns:
+                return v
+        return None
+
+    org_id_col = find_col(col_map["org_id"])
+    org_name_col = find_col(col_map["org_name"])
+    caller_col = find_col(col_map["caller"])
+    email_col = find_col(col_map["email"])
+    phone_col = find_col(col_map["phone"])
+
+    missing = []
+    if org_id_col is None: missing.append("Org ID")
+    if org_name_col is None: missing.append("Name")
+    if caller_col is None: missing.append("Section/Column")
+    if missing:
+        raise ValueError(f"MASTER missing required columns {missing}. Found: {list(df.columns)}")
+
+    out = pd.DataFrame()
+    out["Org ID"] = pd.to_numeric(df[org_id_col], errors="coerce").astype("Int64")
+    out["Name"] = df[org_name_col].map(_clean_str)
+    out["Section/Column"] = df[caller_col].map(_clean_str)
+    out["Email"] = df[email_col].map(_clean_str) if email_col else ""
+    out["Phone Number"] = df[phone_col].map(_clean_str) if phone_col else ""
+
+    out = out.dropna(subset=["Org ID"])
+    out = out[out["Section/Column"] != ""].copy()
+    return out
+
+@st.cache_data(show_spinner=False)
+def load_tracking(path=TRACKING_FILE) -> pd.DataFrame:
+    xl = pd.ExcelFile(path)
+    sheet = TRACKING_SHEET if TRACKING_SHEET in xl.sheet_names else xl.sheet_names[0]
+    df = pd.read_excel(path, sheet_name=sheet)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    col_map = {
+        "org_id": ["OrganizationID", "Organization ID", "Org ID", "OrgID"],
+        "org_name": ["Organization Name", "Org Name", "Name", "Organization"],
+        "date_requested": ["Date Requested", "Requested Date", "Invite Date", "DateRequest"],
+        "event_year": ["Start Date Calendar Year", "Event Year", "Start Year", "Calendar Year"],
+        "event_name": ["Event name", "Event Name", "Event", "EventTitle"],
+        "reg_status": ["Registration Status", "Reg Status", "Status"],
+        "tag_level": ["Tag Level", "Level", "Tag", "Tier"],
+    }
+
+    def find_col(variants):
+        for v in variants:
+            if v in df.columns:
+                return v
+        return None
+
+    org_id_col = find_col(col_map["org_id"])
+    org_name_col = find_col(col_map["org_name"])
+    date_col = find_col(col_map["date_requested"])
+
+    event_year_col = find_col(col_map["event_year"])
+    event_name_col = find_col(col_map["event_name"])
+    reg_col = find_col(col_map["reg_status"])
+    tag_col = find_col(col_map["tag_level"])
+
+    missing = []
+    if org_id_col is None: missing.append("OrganizationID")
+    if org_name_col is None: missing.append("Organization Name")
+    if date_col is None: missing.append("Date Requested")
+    if missing:
+        raise ValueError(f"TRACKING missing required columns {missing}. Found: {list(df.columns)}")
+
+    out = pd.DataFrame()
+    out["OrganizationID"] = pd.to_numeric(df[org_id_col], errors="coerce").astype("Int64")
+    out["Organization Name"] = df[org_name_col].map(_clean_str)
+    out["Date Requested"] = pd.to_datetime(df[date_col], errors="coerce")
+
+    out["Start Date Calendar Year"] = (
+        pd.to_numeric(df[event_year_col], errors="coerce").astype("Int64")
+        if event_year_col else pd.Series([pd.NA] * len(df), dtype="Int64")
+    )
+    out["Event name"] = df[event_name_col].map(_clean_str) if event_name_col else ""
+    out["Registration Status"] = df[reg_col].map(_clean_str) if reg_col else ""
+    out["Tag Level"] = df[tag_col].map(_clean_str) if tag_col else ""
+
+    out = out.dropna(subset=["OrganizationID"]).copy()
+    return out
+
+# ----------------------------
 # UI
 # ----------------------------
 st.title("Caller → Assigned Orgs + Invite Comparison (2025 vs 2026)")
@@ -150,26 +206,30 @@ with st.spinner("Loading data..."):
     master = load_master()
     tracking_raw = load_tracking()
 
+# Add Season and keep only 2025/2026 season-window rows (globally)
 tracking_raw["Season"] = tracking_raw["Date Requested"].apply(assign_season).astype("Int64")
 tracking_raw = tracking_raw[tracking_raw["Season"].isin([2025, 2026])].copy()
 
+# Global filter option lists from the FULL season-filtered tracking file
 ALL_TAG_OPTIONS = sorted(normalize_blank_series(tracking_raw["Tag Level"]).unique().tolist())
 ALL_REG_OPTIONS = sorted(normalize_blank_series(tracking_raw["Registration Status"]).unique().tolist())
 
+# Caller selector
 callers = sorted(master["Section/Column"].dropna().unique().tolist())
-
 st.sidebar.header("Caller")
 caller = st.sidebar.selectbox("Caller (Section/Column)", callers, index=0 if callers else None)
 
+# Assigned orgs for caller
 assigned = master[master["Section/Column"] == caller].copy()
 assigned_org_ids = assigned["Org ID"].dropna().unique().tolist()
 
+# Caller/org-filtered tracking
 trk = tracking_raw[tracking_raw["OrganizationID"].isin(assigned_org_ids)].copy()
 
+# Filters
 st.sidebar.header("Filters")
 tag_sel = st.sidebar.multiselect("Tag Level", ALL_TAG_OPTIONS, default=ALL_TAG_OPTIONS)
 reg_sel = st.sidebar.multiselect("Registration Status", ALL_REG_OPTIONS, default=ALL_REG_OPTIONS)
-
 trk = apply_blank_filter(trk, "Tag Level", tag_sel)
 trk = apply_blank_filter(trk, "Registration Status", reg_sel)
 
@@ -192,7 +252,7 @@ st.caption(
 st.divider()
 
 # ---------------------------------------------------------
-# Layout (STACKED as requested)
+# STACKED LAYOUT
 # Assigned Orgs
 # Invite Comparison by Org (2025 vs 2026)
 # 🔎 Select an org to view details
