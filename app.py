@@ -32,10 +32,6 @@ def normalize_blank_series(s: pd.Series) -> pd.Series:
     return s.fillna("").map(_clean_str).replace({"": "(Blank)"})
 
 def apply_blank_filter(df, col, selected):
-    """
-    Treat '(Blank)' as NA/empty-string and filter accordingly.
-    If user selects all possible values, no-op.
-    """
     if selected is None:
         return df
     ser = normalize_blank_series(df[col])
@@ -82,8 +78,7 @@ def season_pivot_counts(df: pd.DataFrame) -> pd.DataFrame:
     pivot["YoY %"] = np.where(pivot["2025"] == 0, np.nan, (pivot["YoY Δ"] / pivot["2025"]) * 100.0)
 
     pivot = pivot.sort_values(by=["2026", "Total"], ascending=False)
-    pivot = pivot[out_cols]
-    return pivot
+    return pivot[out_cols]
 
 def org_detail_metrics(trk_df: pd.DataFrame, org_id: int):
     d = trk_df[trk_df["OrganizationID"] == org_id]
@@ -95,7 +90,7 @@ def org_detail_metrics(trk_df: pd.DataFrame, org_id: int):
     return inv_2025, inv_2026, total, yoy_delta, yoy_pct
 
 # ----------------------------
-# Robust Loaders (normalize headers to handle underscores/slashes/spaces)
+# Robust header normalization
 # ----------------------------
 def _norm_header(h: str) -> str:
     h = str(h).strip().lower()
@@ -111,6 +106,29 @@ def _norm_header(h: str) -> str:
                 prev_us = True
     return "".join(out).strip("_")
 
+def _find_first_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def _find_cols_by_keywords(df: pd.DataFrame, keywords: list[str]) -> list[str]:
+    # returns columns where ANY keyword appears in the normalized header
+    hits = []
+    for c in df.columns:
+        for k in keywords:
+            if k in c:
+                hits.append(c)
+                break
+    return hits
+
+def _pretty_label(norm_col: str) -> str:
+    # Convert normalized header to a readable label
+    return norm_col.replace("_", " ").title()
+
+# ----------------------------
+# Loaders
+# ----------------------------
 @st.cache_data(show_spinner=False)
 def load_master(path=MASTER_FILE) -> pd.DataFrame:
     xl = pd.ExcelFile(path)
@@ -118,31 +136,17 @@ def load_master(path=MASTER_FILE) -> pd.DataFrame:
     df = pd.read_excel(path, sheet_name=sheet)
     original_headers = list(df.columns)
 
+    # normalize headers
     df.columns = [_norm_header(c) for c in df.columns]
 
-    col_map = {
-        "org_id": ["org_id", "orgid", "organizationid", "organization_id"],
-        "org_name": ["name", "org_name", "organization", "organization_name", "orgname", "account"],
-        "caller": ["section_column", "sectioncolumn", "section", "caller", "owner", "rep", "assigned_to", "assignee"],
-        "email": ["email", "email_address", "e_mail", "mail"],
-        "phone": ["phone_number", "phone", "telephone", "mobile"],
-    }
-
-    def find_col(variants):
-        for v in variants:
-            if v in df.columns:
-                return v
-        return None
-
-    org_id_col = find_col(col_map["org_id"])
-    org_name_col = find_col(col_map["org_name"])
-    caller_col = find_col(col_map["caller"])
-    email_col = find_col(col_map["email"])
-    phone_col = find_col(col_map["phone"])
+    # required columns (robust)
+    org_id_col = _find_first_col(df, ["org_id", "orgid", "organizationid", "organization_id"])
+    name_col   = _find_first_col(df, ["name", "org_name", "organization", "organization_name", "orgname", "account"])
+    caller_col = _find_first_col(df, ["section_column", "sectioncolumn", "section", "caller", "owner", "rep", "assigned_to", "assignee"])
 
     missing = []
     if org_id_col is None: missing.append("Org ID")
-    if org_name_col is None: missing.append("Name")
+    if name_col is None: missing.append("Name")
     if caller_col is None: missing.append("Section/Column")
 
     if missing:
@@ -151,12 +155,44 @@ def load_master(path=MASTER_FILE) -> pd.DataFrame:
             f"Original headers: {original_headers} | Normalized headers: {list(df.columns)}"
         )
 
+    # contact-ish columns: be generous
+    email_cols = _find_cols_by_keywords(df, ["email", "e_mail", "mail"])
+    phone_cols = _find_cols_by_keywords(df, ["phone", "telephone", "mobile", "cell"])
+    contact_name_cols = _find_cols_by_keywords(df, ["contact", "coach", "director", "admin", "name"])
+
+    # but don't duplicate the main org name col in contact fields
+    contact_name_cols = [c for c in contact_name_cols if c not in {name_col}]
+
+    # Build output with canonical cols + extra contact cols
     out = pd.DataFrame()
     out["Org ID"] = pd.to_numeric(df[org_id_col], errors="coerce").astype("Int64")
-    out["Name"] = df[org_name_col].map(_clean_str)
+    out["Name"] = df[name_col].map(_clean_str)
     out["Section/Column"] = df[caller_col].map(_clean_str)
-    out["Email"] = df[email_col].map(_clean_str) if email_col else ""
-    out["Phone Number"] = df[phone_col].map(_clean_str) if phone_col else ""
+
+    # Always include these canonical fields (populate from best match if available)
+    best_email = email_cols[0] if email_cols else None
+    best_phone = phone_cols[0] if phone_cols else None
+    best_contact_name = None
+    # pick a contact-ish name col that is not literally "name" and not org name
+    for c in contact_name_cols:
+        if "organization" not in c and c != name_col:
+            best_contact_name = c
+            break
+
+    out["Email"] = df[best_email].map(_clean_str) if best_email else ""
+    out["Phone Number"] = df[best_phone].map(_clean_str) if best_phone else ""
+    out["Contact Name"] = df[best_contact_name].map(_clean_str) if best_contact_name else ""
+
+    # Also pass through ALL additional contact columns (so you never “lose” info)
+    # We'll prefix them to avoid collisions.
+    extra_cols = []
+    for c in sorted(set(email_cols + phone_cols + contact_name_cols)):
+        if c in {org_id_col, name_col, caller_col, best_email, best_phone, best_contact_name}:
+            continue
+        extra_cols.append(c)
+
+    for c in extra_cols:
+        out[f"Extra: {_pretty_label(c)}"] = df[c].map(_clean_str)
 
     out = out.dropna(subset=["Org ID"])
     out = out[out["Section/Column"] != ""].copy()
@@ -171,30 +207,14 @@ def load_tracking(path=TRACKING_FILE) -> pd.DataFrame:
 
     df.columns = [_norm_header(c) for c in df.columns]
 
-    col_map = {
-        "org_id": ["organizationid", "organization_id", "org_id", "orgid"],
-        "org_name": ["organization_name", "org_name", "name", "organization"],
-        "date_requested": ["date_requested", "requested_date", "invite_date", "daterequest"],
-        "event_year": ["start_date_calendar_year", "event_year", "start_year", "calendar_year"],
-        "event_name": ["event_name", "event", "eventtitle"],
-        "reg_status": ["registration_status", "reg_status", "status"],
-        "tag_level": ["tag_level", "level", "tag", "tier"],
-    }
+    org_id_col = _find_first_col(df, ["organizationid", "organization_id", "org_id", "orgid"])
+    org_name_col = _find_first_col(df, ["organization_name", "org_name", "name", "organization"])
+    date_col = _find_first_col(df, ["date_requested", "requested_date", "invite_date", "daterequest"])
 
-    def find_col(variants):
-        for v in variants:
-            if v in df.columns:
-                return v
-        return None
-
-    org_id_col = find_col(col_map["org_id"])
-    org_name_col = find_col(col_map["org_name"])
-    date_col = find_col(col_map["date_requested"])
-
-    event_year_col = find_col(col_map["event_year"])
-    event_name_col = find_col(col_map["event_name"])
-    reg_col = find_col(col_map["reg_status"])
-    tag_col = find_col(col_map["tag_level"])
+    event_year_col = _find_first_col(df, ["start_date_calendar_year", "event_year", "start_year", "calendar_year"])
+    event_name_col = _find_first_col(df, ["event_name", "event", "eventtitle"])
+    reg_col = _find_first_col(df, ["registration_status", "reg_status", "status"])
+    tag_col = _find_first_col(df, ["tag_level", "level", "tag", "tier"])
 
     missing = []
     if org_id_col is None: missing.append("OrganizationID")
@@ -232,11 +252,11 @@ with st.spinner("Loading data..."):
     master = load_master()
     tracking_raw = load_tracking()
 
-# Add Season and keep only 2025/2026 season-window rows (globally)
+# Season filter
 tracking_raw["Season"] = tracking_raw["Date Requested"].apply(assign_season).astype("Int64")
 tracking_raw = tracking_raw[tracking_raw["Season"].isin([2025, 2026])].copy()
 
-# Global filter options from the FULL season-filtered tracking file
+# Global filter options from full season-filtered tracking file
 ALL_TAG_OPTIONS = sorted(normalize_blank_series(tracking_raw["Tag Level"]).unique().tolist())
 ALL_REG_OPTIONS = sorted(normalize_blank_series(tracking_raw["Registration Status"]).unique().tolist())
 
@@ -278,21 +298,15 @@ st.caption(
 
 st.divider()
 
-# ---------------------------------------------------------
+# ----------------------------
 # STACKED LAYOUT
-# Assigned Orgs
-# Invite Comparison by Org (2025 vs 2026)
-# 🔎 Select an org to view details
-# 📌 Org Details
-# ---------------------------------------------------------
-
-# 1) Assigned Orgs
+# ----------------------------
 st.subheader("Assigned Orgs")
 
-cols = ["Org ID", "Name"]
-for c in ["Email", "Phone Number"]:
-    if c in assigned.columns:
-        cols.append(c)
+# show canonical contact fields + any extra contact fields automatically
+base_cols = ["Org ID", "Name", "Contact Name", "Email", "Phone Number"]
+extra_cols = [c for c in assigned.columns if c.startswith("Extra: ")]
+cols = [c for c in base_cols if c in assigned.columns] + extra_cols
 
 assigned_show = (
     assigned[cols]
@@ -306,7 +320,6 @@ st.dataframe(assigned_show, use_container_width=True, height=420)
 
 st.divider()
 
-# 2) Invite Comparison by Org
 st.subheader("Invite Comparison by Org (2025 vs 2026)")
 
 piv = season_pivot_counts(trk)
@@ -323,7 +336,6 @@ st.dataframe(
 
 st.divider()
 
-# 3) Selector
 st.markdown("### 🔎 Select an org to view details")
 
 org_labels = [
@@ -345,7 +357,6 @@ if selected_label != "(Pick an org)":
 
 st.divider()
 
-# 4) Org Details
 st.subheader("📌 Org Details")
 
 if selected_org_id is None:
@@ -354,14 +365,10 @@ else:
     mrow = assigned_show[assigned_show["OrganizationID"] == selected_org_id]
     org_name_master = mrow["Organization"].iloc[0] if not mrow.empty else ""
 
-    email = mrow["Email"].iloc[0] if (not mrow.empty and "Email" in mrow.columns) else ""
-    phone = mrow["Phone Number"].iloc[0] if (not mrow.empty and "Phone Number" in mrow.columns) else ""
-
     inv25, inv26, total, yoy_delta, yoy_pct = org_detail_metrics(trk, selected_org_id)
 
     tnames = trk.loc[trk["OrganizationID"] == selected_org_id, "Organization Name"].dropna().unique().tolist()
     org_name_tracking = tnames[0] if tnames else ""
-
     header_name = org_name_master or org_name_tracking or f"Org {selected_org_id}"
 
     st.markdown(f"### {header_name}")
@@ -374,8 +381,17 @@ else:
     d4.metric("YoY %", "—" if yoy_pct is None else f"{yoy_pct:.1f}%")
 
     st.markdown("**Contact**")
-    st.write(f"- Email: {email if email else '(Blank)'}")
-    st.write(f"- Phone: {phone if phone else '(Blank)'}")
+
+    # Show ALL contact-ish fields available in the assigned_show row
+    contact_fields = [c for c in assigned_show.columns if c not in ("OrganizationID", "Organization")]
+    if not mrow.empty:
+        for c in contact_fields:
+            val = mrow[c].iloc[0]
+            if pd.isna(val) or str(val).strip() == "":
+                val = "(Blank)"
+            st.write(f"- **{c}**: {val}")
+    else:
+        st.write("(No contact info found in MASTER for this org.)")
 
     with st.expander("Show this org’s invite rows (filtered)"):
         org_rows = trk[trk["OrganizationID"] == selected_org_id].copy()
